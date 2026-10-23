@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Table Cube AR</title>
+<style>
+  :root { --bg: #0d1412; --fg: #eaf3ee; --muted: #9db3a8; --green: #2bd96b; --panel: rgba(10, 18, 15, 0.72); color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #intro { min-height: 100%; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; gap: 18px;
+           padding-block: 32px; padding-left: max(20px, env(safe-area-inset-left, 0px)); padding-right: max(20px, env(safe-area-inset-right, 0px)); max-width: 34rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0; text-wrap: balance; }
+  p { margin: 0; color: var(--muted); }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 14px 20px; cursor: pointer; }
+  button:focus-visible { outline: 3px solid var(--fg); outline-offset: 2px; }
+  #go { background: var(--green); color: #04210f; font-size: 1.1rem; }
+  #go:disabled { opacity: 0.45; }
+  #why { color: #ffb3a3; }
+  /* the overlay shown over the camera while AR runs */
+  #ov { position: fixed; inset: 0; pointer-events: none; }
+  #status { position: absolute; left: 50%; transform: translateX(-50%); top: calc(14px + env(safe-area-inset-top, 0px));
+            background: var(--panel); padding: 10px 16px; border-radius: 12px; max-width: 86vw; text-align: center; font-weight: 600; }
+  #bar { position: absolute; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; gap: 12px; }
+  #bar button { pointer-events: auto; background: var(--panel); color: var(--fg); border: 1px solid rgba(255,255,255,0.25); }
+  #bar button.main { background: var(--green); color: #04210f; border: 0; }
+  #stats { position: absolute; right: calc(10px + env(safe-area-inset-right, 0px)); top: calc(64px + env(safe-area-inset-top, 0px));
+           font: 12px/1.3 ui-monospace, monospace; background: var(--panel); padding: 6px 8px; border-radius: 8px; white-space: pre; }
+</style>
+<script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }</script>
+</head>
+<body>
+<div id="intro">
+  <h1>A green cube on your table</h1>
+  <p>Point the phone at the table next to you and move it slowly from side to side for a few seconds. When the phone has found the table, a 8&nbsp;cm green cube appears on it and stays where it is while you walk around it.</p>
+  <p>Tap the screen to move the cube to where the ring is.</p>
+  <button id="go" disabled>Checking this phone…</button>
+  <p id="why" hidden></p>
+</div>
+<div id="ov" hidden>
+  <div id="status">Move the phone slowly over the table</div>
+  <div id="stats"></div>
+  <div id="bar"><button id="again" class="main" type="button">Place again</button><button id="stop" type="button">Exit</button></div>
+</div>
+<script type="module">
+import * as THREE from "three";
+
+const $ = (id) => document.getElementById(id);
+const go = $("go"), why = $("why");
+const CUBE_M = 0.08;            // edge, metres
+const SETTLE_FRAMES = 25;       // steady hits before the cube is put down by itself
+
+function refuse(msg) { go.disabled = true; go.textContent = "AR is not available here"; why.textContent = msg; why.hidden = false; }
+
+(async () => {
+  if (!window.isSecureContext) return refuse("This page has to be opened over https.");
+  if (!navigator.xr) return refuse("This browser has no WebXR. Open the link in Chrome on Android (Galaxy S24: Chrome, not Samsung Internet).");
+  let ok = false;
+  try { ok = await navigator.xr.isSessionSupported("immersive-ar"); } catch (e) { ok = false; }
+  if (!ok) return refuse("Chrome says this phone cannot run AR here. Install or update \"Google Play Services for AR\" from the Play Store, then reload. If you opened this inside another app, open it in Chrome itself.");
+  go.disabled = false; go.textContent = "Start AR";
+})();
+
+// ---- the scene
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.domElement.style.display = "none";
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334433, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+
+const reticle = new THREE.Mesh(new THREE.RingGeometry(0.05, 0.065, 40).rotateX(-Math.PI / 2),
+                               new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 }));
+reticle.matrixAutoUpdate = false; reticle.visible = false; scene.add(reticle);
+
+const cube = new THREE.Group();
+const box = new THREE.Mesh(new THREE.BoxGeometry(CUBE_M, CUBE_M, CUBE_M),
+                           new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x0a7a35, emissiveIntensity: 0.6, roughness: 0.4 }));
+box.position.y = CUBE_M / 2; cube.add(box);
+const edges = new THREE.LineSegments(new THREE.EdgesGeometry(box.geometry), new THREE.LineBasicMaterial({ color: 0xbaffd0 }));
+edges.position.copy(box.position); cube.add(edges);
+const glow = new THREE.Mesh(new THREE.BoxGeometry(CUBE_M * 1.18, CUBE_M * 1.18, CUBE_M * 1.18),
+                            new THREE.MeshBasicMaterial({ color: 0x2bd96b, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false }));
+glow.position.copy(box.position); cube.add(glow);
+const shadow = new THREE.Mesh(new THREE.CircleGeometry(CUBE_M * 0.85, 40).rotateX(-Math.PI / 2),
+                              new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.35, depthWrite: false }));
+shadow.position.y = 0.001; cube.add(shadow);
+cube.matrixAutoUpdate = false; cube.visible = false; scene.add(cube);
+
+// ---- the session
+let session = null, hitSource = null, refSpace = null, anchor = null, lastHit = null, steady = 0, placed = false;
+let frames = 0, t0 = 0, fps = 0;
+const say = (t) => { $("status").textContent = t; };
+
+go.addEventListener("click", async () => {
+  try {
+    session = await navigator.xr.requestSession("immersive-ar", {
+      requiredFeatures: ["hit-test"], optionalFeatures: ["anchors", "dom-overlay", "local-floor"], domOverlay: { root: $("ov") } });
+  } catch (e) { return refuse("Chrome would not start AR: " + e.message); }
+  $("intro").hidden = true; $("ov").hidden = false; renderer.domElement.style.display = "";
+  renderer.xr.setReferenceSpaceType("local");
+  await renderer.xr.setSession(session);
+  refSpace = renderer.xr.getReferenceSpace();
+  const viewer = await session.requestReferenceSpace("viewer");
+  hitSource = await session.requestHitTestSource({ space: viewer });
+  session.addEventListener("select", () => place(true));
+  session.addEventListener("end", () => { location.reload(); });
+  renderer.setAnimationLoop(onFrame);
+});
+$("again").addEventListener("click", () => place(true));
+$("stop").addEventListener("click", () => session && session.end());
+
+async function place(byHand) {
+  if (!lastHit) { say("No table under the ring yet. Keep moving slowly"); return; }
+  if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
+  const pose = lastHit.getPose(refSpace);
+  cube.matrix.fromArray(pose.transform.matrix); cube.visible = true; placed = true;
+  if (lastHit.createAnchor) {
+    try { anchor = await lastHit.createAnchor(); } catch (e) { anchor = null; }
+  }
+  say(byHand ? "Moved. Walk around it" : "Cube placed on the table. Walk around it");
+}
+
+function onFrame(time, frame) {
+  if (!frame) return;
+  const results = hitSource ? frame.getHitTestResults(hitSource) : [];
+  if (results.length) {
+    lastHit = results[0];
+    const pose = lastHit.getPose(refSpace);
+    reticle.visible = true; reticle.matrix.fromArray(pose.transform.matrix);
+    steady++;
+    if (!placed) say(steady < SETTLE_FRAMES ? "Found a surface. Hold still…" : "Placing the cube");
+    if (!placed && steady >= SETTLE_FRAMES) place(false);
+  } else {
+    reticle.visible = false; steady = 0;
+    if (!placed) say("Move the phone slowly over the table");
+  }
+  if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
+    const p = frame.getPose(anchor.anchorSpace, refSpace);
+    if (p) cube.matrix.fromArray(p.transform.matrix);
+  }
+  frames++;
+  if (time - t0 > 1000) { fps = frames * 1000 / (time - t0); frames = 0; t0 = time;
+    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching"); }
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
