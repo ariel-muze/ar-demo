@@ -37,10 +37,10 @@
   <h1>A green cube on your table</h1>
   <p>Point the phone at the table and move it slowly from side to side, about 40&nbsp;cm above it. When the phone has found the table, an 8&nbsp;cm green cube appears on it and stays where it is while you walk around it.</p>
   <p>Plain or shiny wood is hard for the phone to see. Turn on a light, keep the shine off the camera, and lay a sheet of paper, a book or a cup on the table to give it something to lock onto.</p>
-  <p>Tap the screen to move the cube to where the ring is.</p>
+  <p>Tap the screen to move the cube to where the ring is. The blue grid shows the surface the phone found; the cube sits flat on it.</p>
   <button id="go" disabled>Checking this phone…</button>
   <p id="why" hidden></p>
-  <p id="ver">version 2</p>
+  <p id="ver">version 3</p>
 </div>
 <div id="ov" hidden>
   <div id="status">Move the phone slowly over the table</div>
@@ -99,6 +99,45 @@ const shadow = new THREE.Mesh(new THREE.CircleGeometry(CUBE_M * 0.85, 40).rotate
 shadow.position.y = 0.001; cube.add(shadow);
 cube.matrixAutoUpdate = false; cube.visible = false; scene.add(cube);
 
+// the surface the phone found, drawn as a 60 cm grid lying in it: it follows the ring while searching and
+// stays under the cube once the cube is down
+const GRID_M = 0.6;
+const grid = new THREE.Group();
+const lines = new THREE.GridHelper(GRID_M, 12, 0x7fe0ff, 0x7fe0ff);
+lines.material.transparent = true; lines.material.opacity = 0.75; lines.material.depthWrite = false;
+grid.add(lines);
+const sheet = new THREE.Mesh(new THREE.PlaneGeometry(GRID_M, GRID_M).rotateX(-Math.PI / 2),
+                             new THREE.MeshBasicMaterial({ color: 0x3fb8ff, transparent: true, opacity: 0.12, depthWrite: false }));
+grid.add(sheet);
+grid.matrixAutoUpdate = false; grid.visible = false; scene.add(grid);
+
+// the planes ARCore reports, when Chrome shares them: their outlines on the table
+const planeLines = new Map();
+const planeMat = new THREE.LineBasicMaterial({ color: 0xffd34d });
+function drawPlanes(frame) {
+  const planes = frame.detectedPlanes;
+  if (!planes) return 0;
+  let n = 0;
+  for (const [plane, obj] of planeLines) if (!planes.has(plane)) { scene.remove(obj); planeLines.delete(plane); }
+  for (const plane of planes) {
+    if (plane.orientation && plane.orientation !== "horizontal") continue;
+    const pose = frame.getPose(plane.planeSpace, refSpace);
+    if (!pose) continue;
+    n++;
+    let obj = planeLines.get(plane);
+    if (!obj || obj.userData.t !== plane.lastChangedTime) {
+      if (obj) scene.remove(obj);
+      const pts = plane.polygon.map((p) => new THREE.Vector3(p.x, 0.002, p.z));
+      pts.push(pts[0].clone());
+      obj = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), planeMat);
+      obj.matrixAutoUpdate = false; obj.userData.t = plane.lastChangedTime;
+      scene.add(obj); planeLines.set(plane, obj);
+    }
+    obj.matrix.fromArray(pose.transform.matrix);
+  }
+  return n;
+}
+
 // ---- the session
 let session = null, hitSource = null, refSpace = null, viewerSpace = null, anchor = null, lastHit = null, placed = false;
 let recent = 0, started = 0, frames = 0, t0 = 0, fps = 0, viewerPose = null;
@@ -109,7 +148,7 @@ const up = new THREE.Vector3(), m4 = new THREE.Matrix4();
 go.addEventListener("click", async () => {
   try {
     session = await navigator.xr.requestSession("immersive-ar", {
-      requiredFeatures: ["hit-test"], optionalFeatures: ["anchors", "dom-overlay", "light-estimation"], domOverlay: { root: $("ov") } });
+      requiredFeatures: ["hit-test"], optionalFeatures: ["anchors", "dom-overlay", "plane-detection"], domOverlay: { root: $("ov") } });
   } catch (e) { return refuse("Chrome would not start AR: " + e.message); }
   $("intro").hidden = true; $("ov").hidden = false; renderer.domElement.style.display = "";
   renderer.xr.setReferenceSpaceType("local");
@@ -141,6 +180,7 @@ async function place(byHand) {
   if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
   const pose = lastHit.getPose(refSpace);
   cube.matrix.fromArray(pose.transform.matrix); cube.visible = true; placed = true;
+  grid.matrix.copy(cube.matrix); grid.visible = true;
   $("front").hidden = true; tip("");
   if (lastHit.createAnchor) {
     try { anchor = await lastHit.createAnchor(); } catch (e) { anchor = null; }
@@ -178,11 +218,13 @@ function onFrame(time, frame) {
   if (hit) {
     lastHit = hit;
     reticle.visible = true; reticle.matrix.fromArray(hit.getPose(refSpace).transform.matrix);
+    if (!placed) { grid.visible = true; grid.matrix.copy(reticle.matrix); }
     recent = Math.min(recent + 1, SETTLE_HITS * 2);
     if (!placed) say(recent < SETTLE_HITS ? "Found the table. Hold steady…" : "Placing the cube");
     if (!placed && recent >= SETTLE_HITS) place(false);
   } else {
     reticle.visible = false;
+    if (!placed) grid.visible = false;
     recent = Math.max(0, recent - 1);          // a flicker does not start the count over
     if (!placed) say(results.length ? "That surface is tilted. Aim at the table top" : "Move the phone slowly over the table");
   }
@@ -193,11 +235,12 @@ function onFrame(time, frame) {
   }
   if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
     const p = frame.getPose(anchor.anchorSpace, refSpace);
-    if (p) cube.matrix.fromArray(p.transform.matrix);
+    if (p) { cube.matrix.fromArray(p.transform.matrix); grid.matrix.copy(cube.matrix); }
   }
+  const nPlanes = drawPlanes(frame);
   frames++;
   if (time - t0 > 1000) { fps = frames * 1000 / (time - t0); frames = 0; t0 = time;
-    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching " + waited.toFixed(0) + " s"); }
+    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching " + waited.toFixed(0) + " s") + (frame.detectedPlanes ? "\n" + nPlanes + " table planes" : ""); }
   renderer.render(scene, camera);
 }
 </script>
