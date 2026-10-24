@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Table Cube AR</title>
+<title>Plane Cube AR</title>
 <style>
   :root { --bg: #0d1412; --fg: #eaf3ee; --muted: #9db3a8; --green: #2bd96b; --panel: rgba(10, 18, 15, 0.72); color-scheme: dark; }
   html, body { height: 100%; margin: 0; }
@@ -29,24 +29,29 @@
   #tip { position: absolute; left: 50%; transform: translateX(-50%); top: calc(64px + env(safe-area-inset-top, 0px)); max-width: 80vw;
          background: var(--panel); padding: 8px 12px; border-radius: 10px; font-size: 14px; color: var(--muted); text-align: center; }
   #ver { font-size: 12px; color: var(--muted); }
+  #badge { position: absolute; left: calc(12px + env(safe-area-inset-left, 0px)); top: calc(130px + env(safe-area-inset-top, 0px));
+           padding: 6px 12px; border-radius: 8px; font-weight: 800; letter-spacing: 0.06em; color: #111; background: #ffb020; }
+  #badge.locked { background: var(--green); color: #04210f; }
+  #badge.lost { background: #ff5a4a; color: #fff; }
 </style>
 <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }</script>
 </head>
 <body>
 <div id="intro">
-  <h1>A green cube on your table</h1>
-  <p>Point the phone at the table and move it slowly from side to side, about 40&nbsp;cm above it. When the phone has found the table, an 8&nbsp;cm green cube appears on it and stays where it is while you walk around it.</p>
-  <p>Plain or shiny wood is hard for the phone to see. Turn on a light, keep the shine off the camera, and lay a sheet of paper, a book or a cup on the table to give it something to lock onto.</p>
-  <p>Tap the screen to move the cube to where the ring is. The blue grid shows the surface the phone found; the cube sits flat on it.</p>
+  <h1>A green cube on any flat surface</h1>
+  <p>Point the phone at a flat surface (a table, the floor, a wall, a tilted board) and move it slowly from side to side, about 40&nbsp;cm away. The badge says <b>SEARCHING</b> while it gathers points on one surface.</p>
+  <p>When it has enough of the surface, the badge turns green, <b>LOCKED</b>, a yellow rectangle is drawn over the area it found, and an 8&nbsp;cm green cube sits flat on the surface at the rectangle's centre. Both stay put while you walk around.</p>
+  <p>Tap <b>Find again</b> (or the screen) to throw the lock away and search where you are aiming. Plain or shiny wood is hard to see: turn on a light and lay a sheet of paper or a book on it.</p>
   <button id="go" disabled>Checking this phone…</button>
   <p id="why" hidden></p>
-  <p id="ver">version 3</p>
+  <p id="ver">version 4</p>
 </div>
 <div id="ov" hidden>
-  <div id="status">Move the phone slowly over the table</div>
+  <div id="status">Move the phone slowly over a flat surface</div>
+  <div id="badge">SEARCHING</div>
   <div id="tip" hidden></div>
   <div id="stats"></div>
-  <div id="bar"><button id="again" class="main" type="button">Place here</button><button id="front" type="button" hidden>Put it in front of me</button><button id="stop" type="button">Exit</button></div>
+  <div id="bar"><button id="again" class="main" type="button">Find again</button><button id="front" type="button" hidden>Put it in front of me</button><button id="stop" type="button">Exit</button></div>
 </div>
 <script type="module">
 import * as THREE from "three";
@@ -54,9 +59,12 @@ import * as THREE from "three";
 const $ = (id) => document.getElementById(id);
 const go = $("go"), why = $("why");
 const CUBE_M = 0.08;            // edge, metres
-const SETTLE_HITS = 12;         // table hits within the last second or so before the cube is put down by itself
-const MAX_TILT_DEG = 25;        // a hit whose surface leans more than this is a wall or an edge, not the table top
-const HELP_AFTER_S = 8;         // no table by then: show tips and offer to put the cube in front
+const LOCK_HITS = 25;           // hits on one surface before it counts as locked
+const LOCK_SPAN_M = 0.15;       // ... and they must cover at least this much of it in both directions
+const PLANE_TOL_M = 0.02;       // a hit this far off the surface belongs to another one
+const PLANE_TOL_DEG = 15;       // ... or one whose normal leans this much
+const MIN_STEP_M = 0.01;        // hits closer than this to the last kept one add nothing
+const HELP_AFTER_S = 10;        // no lock by then: show tips and offer to put the cube in front
 
 function refuse(msg) { go.disabled = true; go.textContent = "AR is not available here"; why.textContent = msg; why.hidden = false; }
 
@@ -99,28 +107,32 @@ const shadow = new THREE.Mesh(new THREE.CircleGeometry(CUBE_M * 0.85, 40).rotate
 shadow.position.y = 0.001; cube.add(shadow);
 cube.matrixAutoUpdate = false; cube.visible = false; scene.add(cube);
 
-// the surface the phone found, drawn as a 60 cm grid lying in it: it follows the ring while searching and
-// stays under the cube once the cube is down
-const GRID_M = 0.6;
-const grid = new THREE.Group();
-const lines = new THREE.GridHelper(GRID_M, 12, 0x7fe0ff, 0x7fe0ff);
-lines.material.transparent = true; lines.material.opacity = 0.75; lines.material.depthWrite = false;
-grid.add(lines);
-const sheet = new THREE.Mesh(new THREE.PlaneGeometry(GRID_M, GRID_M).rotateX(-Math.PI / 2),
-                             new THREE.MeshBasicMaterial({ color: 0x3fb8ff, transparent: true, opacity: 0.12, depthWrite: false }));
-grid.add(sheet);
-grid.matrixAutoUpdate = false; grid.visible = false; scene.add(grid);
+// the locked surface: a rectangle over the area found, in the surface's own frame (y along its normal), with the
+// cube at its centre; both hang off one anchor
+const rectSheet = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
+                                 new THREE.MeshBasicMaterial({ color: 0x3fb8ff, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide }));
+rectSheet.position.y = 0.001;
+const rectLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(
+  [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]].map(([x, z]) => new THREE.Vector3(x, 0.002, z))),
+  new THREE.LineBasicMaterial({ color: 0xffd34d }));
+const rect = new THREE.Group(); rect.add(rectSheet, rectLine);
+const locked = new THREE.Group(); locked.add(rect);
+locked.matrixAutoUpdate = false; locked.visible = false; scene.add(locked);
+cube.matrixAutoUpdate = true; scene.remove(cube); locked.add(cube);
 
-// the planes ARCore reports, when Chrome shares them: their outlines on the table
+// the hits gathered while searching, shown as small dots so you can see the surface fill in
+const dotGeo = new THREE.SphereGeometry(0.004, 6, 4), dotMat = new THREE.MeshBasicMaterial({ color: 0x7fe0ff });
+const dots = new THREE.Group(); scene.add(dots);
+
+// the planes ARCore reports, when Chrome shares them: their outlines, faint, any orientation
 const planeLines = new Map();
-const planeMat = new THREE.LineBasicMaterial({ color: 0xffd34d });
+const planeMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 });
 function drawPlanes(frame) {
   const planes = frame.detectedPlanes;
   if (!planes) return 0;
   let n = 0;
   for (const [plane, obj] of planeLines) if (!planes.has(plane)) { scene.remove(obj); planeLines.delete(plane); }
   for (const plane of planes) {
-    if (plane.orientation && plane.orientation !== "horizontal") continue;
     const pose = frame.getPose(plane.planeSpace, refSpace);
     if (!pose) continue;
     n++;
@@ -139,11 +151,14 @@ function drawPlanes(frame) {
 }
 
 // ---- the session
-let session = null, hitSource = null, refSpace = null, viewerSpace = null, anchor = null, lastHit = null, placed = false;
-let recent = 0, started = 0, frames = 0, t0 = 0, fps = 0, viewerPose = null;
+let session = null, hitSource = null, refSpace = null, viewerSpace = null, anchor = null, placed = false;
+let started = 0, frames = 0, t0 = 0, fps = 0, viewerPose = null, lostFor = 0;
+// the surface being gathered: a point on it, its normal, and the hits that agree with both
+let cand = null;
 const say = (t) => { $("status").textContent = t; };
 const tip = (t) => { $("tip").textContent = t || ""; $("tip").hidden = !t; };
-const up = new THREE.Vector3(), m4 = new THREE.Matrix4();
+const m4 = new THREE.Matrix4();
+function badge(state) { const b = $("badge"); b.textContent = state; b.className = state === "LOCKED" ? "locked" : state === "LOST" ? "lost" : ""; }
 
 go.addEventListener("click", async () => {
   try {
@@ -158,34 +173,138 @@ go.addEventListener("click", async () => {
   // planes first; feature points as well, which a plain table top gives sooner than a whole plane
   try { hitSource = await session.requestHitTestSource({ space: viewerSpace, entityTypes: ["plane", "point"] }); }
   catch (e) { hitSource = await session.requestHitTestSource({ space: viewerSpace }); }
-  session.addEventListener("select", () => place(true));
+  session.addEventListener("select", () => reset());
   session.addEventListener("end", () => { location.reload(); });
   started = performance.now();
   renderer.setAnimationLoop(onFrame);
 });
 // a tap on a button is not a tap on the table
 $("bar").addEventListener("beforexrselect", (e) => e.preventDefault());
-$("again").addEventListener("click", (e) => { e.stopPropagation(); place(true); });
+$("again").addEventListener("click", (e) => { e.stopPropagation(); reset(); });
 $("front").addEventListener("click", (e) => { e.stopPropagation(); putInFront(); });
 $("stop").addEventListener("click", (e) => { e.stopPropagation(); session && session.end(); });
 
-function level(pose) {
-  // the hit's surface normal is its pose's y axis; keep only surfaces that face up
-  m4.fromArray(pose.transform.matrix); up.setFromMatrixColumn(m4, 1);
-  return up.y >= Math.cos(MAX_TILT_DEG * Math.PI / 180);
+function reset() {
+  if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
+  cand = null; placed = false; locked.visible = false; cube.visible = false; lostFor = 0;
+  dots.clear(); started = performance.now(); $("front").hidden = true; tip("");
+  badge("SEARCHING"); say("Move the phone slowly over a flat surface");
 }
 
-async function place(byHand) {
-  if (!lastHit) { say("No table under the ring yet. Keep sweeping slowly"); return; }
-  if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
-  const pose = lastHit.getPose(refSpace);
-  cube.matrix.fromArray(pose.transform.matrix); cube.visible = true; placed = true;
-  grid.matrix.copy(cube.matrix); grid.visible = true;
-  $("front").hidden = true; tip("");
-  if (lastHit.createAnchor) {
-    try { anchor = await lastHit.createAnchor(); } catch (e) { anchor = null; }
+// the normal of a set of points: the eigenvector of their scatter with the smallest eigenvalue, found by power
+// iteration on (trace - scatter), which turns smallest into largest
+function fitNormal(pts, guess) {
+  const c = new THREE.Vector3(); for (const p of pts) c.add(p); c.multiplyScalar(1 / pts.length);
+  const S = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (const p of pts) { const d = [p.x - c.x, p.y - c.y, p.z - c.z];
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) S[3 * i + j] += d[i] * d[j]; }
+  const tr = S[0] + S[4] + S[8];
+  let v = guess.clone();
+  for (let k = 0; k < 50; k++) {
+    const w = new THREE.Vector3(tr * v.x - (S[0] * v.x + S[1] * v.y + S[2] * v.z),
+                                tr * v.y - (S[3] * v.x + S[4] * v.y + S[5] * v.z),
+                                tr * v.z - (S[6] * v.x + S[7] * v.y + S[8] * v.z));
+    if (w.lengthSq() < 1e-20) break;
+    v = w.normalize();
   }
-  say(byHand ? "Moved. Walk around it" : "Cube placed on the table. Walk around it");
+  if (v.dot(guess) < 0) v.negate();
+  return { c, n: v };
+}
+
+// in-plane axes for a normal
+function axes(n) {
+  const ref = Math.abs(n.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+  const u = new THREE.Vector3().crossVectors(ref, n).normalize();
+  return [u, new THREE.Vector3().crossVectors(u, n)];
+}
+
+// the smallest rectangle around 2-D points, trying every direction in 2 degree steps
+function minRect(p2) {
+  let best = null;
+  for (let a = 0; a < 90; a += 2) {
+    const ca = Math.cos(a * Math.PI / 180), sa = Math.sin(a * Math.PI / 180);
+    let s0 = 1e9, s1 = -1e9, t0_ = 1e9, t1 = -1e9;
+    for (const [x, y] of p2) { const s = x * ca + y * sa, t = -x * sa + y * ca;
+      s0 = Math.min(s0, s); s1 = Math.max(s1, s); t0_ = Math.min(t0_, t); t1 = Math.max(t1, t); }
+    const area = (s1 - s0) * (t1 - t0_);
+    if (!best || area < best.area) best = { area, a, ca, sa, w: s1 - s0, h: t1 - t0_, s: (s0 + s1) / 2, t: (t0_ + t1) / 2 };
+  }
+  // back from the rotated frame to the original one
+  best.cx = best.s * best.ca - best.t * best.sa; best.cy = best.s * best.sa + best.t * best.ca;
+  return best;
+}
+
+// the area covered by points on a surface: the rectangle's centre, size, and a pose whose y axis is the normal
+function areaOf(pts, c, n) {
+  const [e1, e2] = axes(n);
+  const p2 = pts.map((p) => { const d = p.clone().sub(c); return [d.dot(e1), d.dot(e2)]; });
+  // drop the outer few per cent so one stray hit does not stretch the rectangle
+  const trim = (k) => { const v = p2.map((q) => q[k]).sort((a, b) => a - b);
+    return [v[Math.floor(v.length * 0.03)], v[Math.ceil(v.length * 0.97) - 1]]; };
+  const [x0, x1] = trim(0), [y0, y1] = trim(1);
+  const kept = p2.filter(([x, y]) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
+  const r = minRect(kept.length >= 4 ? kept : p2);
+  const u = e1.clone().multiplyScalar(r.ca).addScaledVector(e2, r.sa);
+  const z = new THREE.Vector3().crossVectors(u, n);
+  const centre = c.clone().addScaledVector(e1, r.cx).addScaledVector(e2, r.cy);
+  return { w: r.w, h: r.h, centre, pose: new THREE.Matrix4().makeBasis(u, n, z).setPosition(centre) };
+}
+
+// one more hit: it joins the surface being gathered, or starts a new one if it disagrees and that one is young
+function addHit(p, n) {
+  if (!cand || (cand.pts.length < 6 && (Math.abs(p.clone().sub(cand.c).dot(cand.n)) > PLANE_TOL_M || n.dot(cand.n) < Math.cos(PLANE_TOL_DEG * Math.PI / 180)))) {
+    cand = { c: p.clone(), n: n.clone(), pts: [p.clone()], misses: 0 }; dots.clear(); addDot(p); return;
+  }
+  const off = Math.abs(p.clone().sub(cand.c).dot(cand.n));
+  if (off > PLANE_TOL_M || n.dot(cand.n) < Math.cos(PLANE_TOL_DEG * Math.PI / 180)) {
+    // a mature surface survives stray hits, but many in a row mean the phone is now looking at another one
+    if (++cand.misses > 40) cand = null, dots.clear();
+    return;
+  }
+  cand.misses = 0;
+  if (p.distanceTo(cand.pts[cand.pts.length - 1]) < MIN_STEP_M) return;
+  cand.pts.push(p.clone()); addDot(p);
+  if (cand.pts.length >= 3 && cand.pts.length % 3 === 0) {
+    const f = fitNormal(cand.pts, cand.n);
+    // the fit only takes over once the points spread in two directions; until then the hits' own normals lead
+    const a = areaOf(cand.pts, f.c, f.n);
+    if (Math.min(a.w, a.h) > 0.06) { cand.c = f.c; cand.n = f.n; }
+  }
+}
+function addDot(p) { const d = new THREE.Mesh(dotGeo, dotMat); d.position.copy(p); dots.add(d); }
+
+// the surface is big enough: put the rectangle over it, the cube at its centre, and anchor both
+async function lock(frame, a) {
+  placed = true; dots.clear();
+  rect.scale.set(a.w, 1, a.h); rect.visible = true;
+  cube.visible = true; cube.position.set(0, 0, 0);
+  locked.matrix.copy(a.pose); locked.visible = true;
+  badge("LOCKED");
+  say("Locked: " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm. Walk around it");
+  $("front").hidden = true; tip("");
+  if (frame.createAnchor) {
+    const pos = new THREE.Vector3(), q = new THREE.Quaternion(), sc = new THREE.Vector3();
+    a.pose.decompose(pos, q, sc);
+    try { anchor = await frame.createAnchor(new XRRigidTransform({ x: pos.x, y: pos.y, z: pos.z }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace); }
+    catch (e) { anchor = null; }
+  }
+}
+
+// a plane ARCore itself reports under the hit, when Chrome shares planes: its outline is the area, if it is big
+function arcoreArea(frame, p) {
+  if (!frame.detectedPlanes) return null;
+  for (const plane of frame.detectedPlanes) {
+    const pose = frame.getPose(plane.planeSpace, refSpace);
+    if (!pose || plane.polygon.length < 3) continue;
+    m4.fromArray(pose.transform.matrix);
+    const n = new THREE.Vector3().setFromMatrixColumn(m4, 1).normalize();
+    const o = new THREE.Vector3().setFromMatrixPosition(m4);
+    if (Math.abs(p.clone().sub(o).dot(n)) > PLANE_TOL_M) continue;
+    const pts = plane.polygon.map((q) => new THREE.Vector3(q.x, 0, q.z).applyMatrix4(m4));
+    const a = areaOf(pts, o, n);
+    if (Math.min(a.w, a.h) >= LOCK_SPAN_M) return a;
+  }
+  return null;
 }
 
 async function putInFront() {
@@ -196,15 +315,16 @@ async function putInFront() {
   const p = new THREE.Vector3().setFromMatrixPosition(m4);
   const fwd = new THREE.Vector3(0, 0, -1).transformDirection(m4); fwd.y = 0; fwd.normalize();
   p.addScaledVector(fwd, 0.4); p.y -= 0.25;
-  cube.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); cube.visible = true; placed = true;
+  locked.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); locked.visible = true; rect.visible = false;
+  cube.visible = true; placed = true;
   if (frameRef && frameRef.createAnchor) {
     try {
-      const q = new THREE.Quaternion().setFromRotationMatrix(cube.matrix);
+      const q = new THREE.Quaternion().setFromRotationMatrix(locked.matrix);
       anchor = await frameRef.createAnchor(new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace);
     } catch (e) { anchor = null; }
   }
-  $("front").hidden = true; tip("Not on the table: this one floats where the table should be. Tap Place here once the ring shows.");
-  say("Cube in front of you");
+  $("front").hidden = true; tip("Not on a surface: this one floats in front of you. Tap Find again to search.");
+  badge("SEARCHING"); say("Cube in front of you");
 }
 
 let frameRef = null;
@@ -213,34 +333,44 @@ function onFrame(time, frame) {
   frameRef = frame;
   viewerPose = frame.getViewerPose(refSpace);
   const results = hitSource ? frame.getHitTestResults(hitSource) : [];
-  let hit = null;
-  for (const r of results) { const p = r.getPose(refSpace); if (p && level(p)) { hit = r; break; } }
-  if (hit) {
-    lastHit = hit;
-    reticle.visible = true; reticle.matrix.fromArray(hit.getPose(refSpace).transform.matrix);
-    if (!placed) { grid.visible = true; grid.matrix.copy(reticle.matrix); }
-    recent = Math.min(recent + 1, SETTLE_HITS * 2);
-    if (!placed) say(recent < SETTLE_HITS ? "Found the table. Hold steady…" : "Placing the cube");
-    if (!placed && recent >= SETTLE_HITS) place(false);
-  } else {
-    reticle.visible = false;
-    if (!placed) grid.visible = false;
-    recent = Math.max(0, recent - 1);          // a flicker does not start the count over
-    if (!placed) say(results.length ? "That surface is tilted. Aim at the table top" : "Move the phone slowly over the table");
+  const hp = results.length ? results[0].getPose(refSpace) : null;
+  if (hp) {
+    m4.fromArray(hp.transform.matrix);
+    reticle.visible = !placed; reticle.matrix.copy(m4);
+  } else reticle.visible = false;
+  if (!placed) {
+    if (hp) {
+      const p = new THREE.Vector3().setFromMatrixPosition(m4), n = new THREE.Vector3().setFromMatrixColumn(m4, 1).normalize();
+      const big = arcoreArea(frame, p);
+      if (big) lock(frame, big);
+      else {
+        addHit(p, n);
+        const a = cand && cand.pts.length >= 4 ? areaOf(cand.pts, cand.c, cand.n) : null;
+        if (a && cand.pts.length >= LOCK_HITS && Math.min(a.w, a.h) >= LOCK_SPAN_M) lock(frame, a);
+        else say("Found a surface: " + (cand ? cand.pts.length : 0) + "/" + LOCK_HITS + " points" +
+                 (a ? ", " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm (need " + LOCK_SPAN_M * 100 + ")" : "") + ". Keep sweeping");
+      }
+    } else say("Move the phone slowly over a flat surface");
+    const waited = (performance.now() - started) / 1000;
+    if (!placed && waited > HELP_AFTER_S) {
+      tip("Plain wood is hard to see: turn on a light, avoid the shine, put paper or a book on it, and sweep wider.");
+      $("front").hidden = false;
+    }
   }
-  const waited = (performance.now() - started) / 1000;
-  if (!placed && waited > HELP_AFTER_S) {
-    tip("Wood is hard to see: turn on a light, avoid the shine, put paper or a book on the table, and sweep a little higher.");
-    $("front").hidden = false;
-  }
-  if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
-    const p = frame.getPose(anchor.anchorSpace, refSpace);
-    if (p) { cube.matrix.fromArray(p.transform.matrix); grid.matrix.copy(cube.matrix); }
+  if (anchor) {
+    const tracked = !frame.trackedAnchors || frame.trackedAnchors.has(anchor);
+    const p = tracked ? frame.getPose(anchor.anchorSpace, refSpace) : null;
+    if (p) {
+      locked.matrix.fromArray(p.transform.matrix);
+      if (lostFor > 15 && rect.visible) { badge("LOCKED"); say("Back on the surface"); }
+      lostFor = 0;
+    }
+    else if (++lostFor > 15) { badge("LOST"); say("Lost the surface. Hold still and aim back at it, or tap Find again"); }
   }
   const nPlanes = drawPlanes(frame);
   frames++;
   if (time - t0 > 1000) { fps = frames * 1000 / (time - t0); frames = 0; t0 = time;
-    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching " + waited.toFixed(0) + " s") + (frame.detectedPlanes ? "\n" + nPlanes + " table planes" : ""); }
+    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching") + (frame.detectedPlanes ? "\n" + nPlanes + " ARCore planes" : ""); }
   renderer.render(scene, camera);
 }
 </script>
