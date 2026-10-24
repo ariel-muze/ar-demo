@@ -24,23 +24,29 @@
   #bar { position: absolute; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; justify-content: center; gap: 12px; }
   #bar button { pointer-events: auto; background: var(--panel); color: var(--fg); border: 1px solid rgba(255,255,255,0.25); }
   #bar button.main { background: var(--green); color: #04210f; border: 0; }
-  #stats { position: absolute; right: calc(10px + env(safe-area-inset-right, 0px)); top: calc(64px + env(safe-area-inset-top, 0px));
+  #stats { position: absolute; right: calc(10px + env(safe-area-inset-right, 0px)); top: calc(130px + env(safe-area-inset-top, 0px));
            font: 12px/1.3 ui-monospace, monospace; background: var(--panel); padding: 6px 8px; border-radius: 8px; white-space: pre; }
+  #tip { position: absolute; left: 50%; transform: translateX(-50%); top: calc(64px + env(safe-area-inset-top, 0px)); max-width: 80vw;
+         background: var(--panel); padding: 8px 12px; border-radius: 10px; font-size: 14px; color: var(--muted); text-align: center; }
+  #ver { font-size: 12px; color: var(--muted); }
 </style>
 <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.169.0/build/three.module.js" } }</script>
 </head>
 <body>
 <div id="intro">
   <h1>A green cube on your table</h1>
-  <p>Point the phone at the table next to you and move it slowly from side to side for a few seconds. When the phone has found the table, a 8&nbsp;cm green cube appears on it and stays where it is while you walk around it.</p>
+  <p>Point the phone at the table and move it slowly from side to side, about 40&nbsp;cm above it. When the phone has found the table, an 8&nbsp;cm green cube appears on it and stays where it is while you walk around it.</p>
+  <p>Plain or shiny wood is hard for the phone to see. Turn on a light, keep the shine off the camera, and lay a sheet of paper, a book or a cup on the table to give it something to lock onto.</p>
   <p>Tap the screen to move the cube to where the ring is.</p>
   <button id="go" disabled>Checking this phone…</button>
   <p id="why" hidden></p>
+  <p id="ver">version 2</p>
 </div>
 <div id="ov" hidden>
   <div id="status">Move the phone slowly over the table</div>
+  <div id="tip" hidden></div>
   <div id="stats"></div>
-  <div id="bar"><button id="again" class="main" type="button">Place again</button><button id="stop" type="button">Exit</button></div>
+  <div id="bar"><button id="again" class="main" type="button">Place here</button><button id="front" type="button" hidden>Put it in front of me</button><button id="stop" type="button">Exit</button></div>
 </div>
 <script type="module">
 import * as THREE from "three";
@@ -48,16 +54,18 @@ import * as THREE from "three";
 const $ = (id) => document.getElementById(id);
 const go = $("go"), why = $("why");
 const CUBE_M = 0.08;            // edge, metres
-const SETTLE_FRAMES = 25;       // steady hits before the cube is put down by itself
+const SETTLE_HITS = 12;         // table hits within the last second or so before the cube is put down by itself
+const MAX_TILT_DEG = 25;        // a hit whose surface leans more than this is a wall or an edge, not the table top
+const HELP_AFTER_S = 8;         // no table by then: show tips and offer to put the cube in front
 
 function refuse(msg) { go.disabled = true; go.textContent = "AR is not available here"; why.textContent = msg; why.hidden = false; }
 
 (async () => {
   if (!window.isSecureContext) return refuse("This page has to be opened over https.");
-  if (!navigator.xr) return refuse("This browser has no WebXR. Open the link in Chrome on Android (Galaxy S24: Chrome, not Samsung Internet).");
+  if (!navigator.xr) return refuse("This browser has no WebXR. Open the link in Chrome on Android (Galaxy S24: Chrome, not Samsung Internet or the Claude app).");
   let ok = false;
   try { ok = await navigator.xr.isSessionSupported("immersive-ar"); } catch (e) { ok = false; }
-  if (!ok) return refuse("Chrome says this phone cannot run AR here. Install or update \"Google Play Services for AR\" from the Play Store, then reload. If you opened this inside another app, open it in Chrome itself.");
+  if (!ok) return refuse("Chrome says this phone cannot run AR here. Open the link in Chrome itself, not inside another app. If it still says this, update Chrome and \"Google Play Services for AR\" in the Play Store.");
   go.disabled = false; go.textContent = "Start AR";
 })();
 
@@ -70,7 +78,7 @@ renderer.domElement.style.display = "none";
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x334433, 1.6));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x443322, 1.6));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(0.5, 1, 0.3); scene.add(sun);
 
 const reticle = new THREE.Mesh(new THREE.RingGeometry(0.05, 0.065, 40).rotateX(-Math.PI / 2),
@@ -92,52 +100,96 @@ shadow.position.y = 0.001; cube.add(shadow);
 cube.matrixAutoUpdate = false; cube.visible = false; scene.add(cube);
 
 // ---- the session
-let session = null, hitSource = null, refSpace = null, anchor = null, lastHit = null, steady = 0, placed = false;
-let frames = 0, t0 = 0, fps = 0;
+let session = null, hitSource = null, refSpace = null, viewerSpace = null, anchor = null, lastHit = null, placed = false;
+let recent = 0, started = 0, frames = 0, t0 = 0, fps = 0, viewerPose = null;
 const say = (t) => { $("status").textContent = t; };
+const tip = (t) => { $("tip").textContent = t || ""; $("tip").hidden = !t; };
+const up = new THREE.Vector3(), m4 = new THREE.Matrix4();
 
 go.addEventListener("click", async () => {
   try {
     session = await navigator.xr.requestSession("immersive-ar", {
-      requiredFeatures: ["hit-test"], optionalFeatures: ["anchors", "dom-overlay", "local-floor"], domOverlay: { root: $("ov") } });
+      requiredFeatures: ["hit-test"], optionalFeatures: ["anchors", "dom-overlay", "light-estimation"], domOverlay: { root: $("ov") } });
   } catch (e) { return refuse("Chrome would not start AR: " + e.message); }
   $("intro").hidden = true; $("ov").hidden = false; renderer.domElement.style.display = "";
   renderer.xr.setReferenceSpaceType("local");
   await renderer.xr.setSession(session);
   refSpace = renderer.xr.getReferenceSpace();
-  const viewer = await session.requestReferenceSpace("viewer");
-  hitSource = await session.requestHitTestSource({ space: viewer });
+  viewerSpace = await session.requestReferenceSpace("viewer");
+  // planes first; feature points as well, which a plain table top gives sooner than a whole plane
+  try { hitSource = await session.requestHitTestSource({ space: viewerSpace, entityTypes: ["plane", "point"] }); }
+  catch (e) { hitSource = await session.requestHitTestSource({ space: viewerSpace }); }
   session.addEventListener("select", () => place(true));
   session.addEventListener("end", () => { location.reload(); });
+  started = performance.now();
   renderer.setAnimationLoop(onFrame);
 });
-$("again").addEventListener("click", () => place(true));
-$("stop").addEventListener("click", () => session && session.end());
+// a tap on a button is not a tap on the table
+$("bar").addEventListener("beforexrselect", (e) => e.preventDefault());
+$("again").addEventListener("click", (e) => { e.stopPropagation(); place(true); });
+$("front").addEventListener("click", (e) => { e.stopPropagation(); putInFront(); });
+$("stop").addEventListener("click", (e) => { e.stopPropagation(); session && session.end(); });
+
+function level(pose) {
+  // the hit's surface normal is its pose's y axis; keep only surfaces that face up
+  m4.fromArray(pose.transform.matrix); up.setFromMatrixColumn(m4, 1);
+  return up.y >= Math.cos(MAX_TILT_DEG * Math.PI / 180);
+}
 
 async function place(byHand) {
-  if (!lastHit) { say("No table under the ring yet. Keep moving slowly"); return; }
+  if (!lastHit) { say("No table under the ring yet. Keep sweeping slowly"); return; }
   if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
   const pose = lastHit.getPose(refSpace);
   cube.matrix.fromArray(pose.transform.matrix); cube.visible = true; placed = true;
+  $("front").hidden = true; tip("");
   if (lastHit.createAnchor) {
     try { anchor = await lastHit.createAnchor(); } catch (e) { anchor = null; }
   }
   say(byHand ? "Moved. Walk around it" : "Cube placed on the table. Walk around it");
 }
 
+async function putInFront() {
+  // no table found: 40 cm ahead and 25 cm below the phone, upright, held by the phone's own tracking
+  if (!viewerPose) return;
+  if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
+  m4.fromArray(viewerPose.transform.matrix);
+  const p = new THREE.Vector3().setFromMatrixPosition(m4);
+  const fwd = new THREE.Vector3(0, 0, -1).transformDirection(m4); fwd.y = 0; fwd.normalize();
+  p.addScaledVector(fwd, 0.4); p.y -= 0.25;
+  cube.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); cube.visible = true; placed = true;
+  if (frameRef && frameRef.createAnchor) {
+    try {
+      const q = new THREE.Quaternion().setFromRotationMatrix(cube.matrix);
+      anchor = await frameRef.createAnchor(new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace);
+    } catch (e) { anchor = null; }
+  }
+  $("front").hidden = true; tip("Not on the table: this one floats where the table should be. Tap Place here once the ring shows.");
+  say("Cube in front of you");
+}
+
+let frameRef = null;
 function onFrame(time, frame) {
   if (!frame) return;
+  frameRef = frame;
+  viewerPose = frame.getViewerPose(refSpace);
   const results = hitSource ? frame.getHitTestResults(hitSource) : [];
-  if (results.length) {
-    lastHit = results[0];
-    const pose = lastHit.getPose(refSpace);
-    reticle.visible = true; reticle.matrix.fromArray(pose.transform.matrix);
-    steady++;
-    if (!placed) say(steady < SETTLE_FRAMES ? "Found a surface. Hold still…" : "Placing the cube");
-    if (!placed && steady >= SETTLE_FRAMES) place(false);
+  let hit = null;
+  for (const r of results) { const p = r.getPose(refSpace); if (p && level(p)) { hit = r; break; } }
+  if (hit) {
+    lastHit = hit;
+    reticle.visible = true; reticle.matrix.fromArray(hit.getPose(refSpace).transform.matrix);
+    recent = Math.min(recent + 1, SETTLE_HITS * 2);
+    if (!placed) say(recent < SETTLE_HITS ? "Found the table. Hold steady…" : "Placing the cube");
+    if (!placed && recent >= SETTLE_HITS) place(false);
   } else {
-    reticle.visible = false; steady = 0;
-    if (!placed) say("Move the phone slowly over the table");
+    reticle.visible = false;
+    recent = Math.max(0, recent - 1);          // a flicker does not start the count over
+    if (!placed) say(results.length ? "That surface is tilted. Aim at the table top" : "Move the phone slowly over the table");
+  }
+  const waited = (performance.now() - started) / 1000;
+  if (!placed && waited > HELP_AFTER_S) {
+    tip("Wood is hard to see: turn on a light, avoid the shine, put paper or a book on the table, and sweep a little higher.");
+    $("front").hidden = false;
   }
   if (anchor && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
     const p = frame.getPose(anchor.anchorSpace, refSpace);
@@ -145,7 +197,7 @@ function onFrame(time, frame) {
   }
   frames++;
   if (time - t0 > 1000) { fps = frames * 1000 / (time - t0); frames = 0; t0 = time;
-    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching"); }
+    $("stats").textContent = fps.toFixed(0) + " fps\n" + (anchor ? "anchored" : placed ? "placed (no anchor)" : "searching " + waited.toFixed(0) + " s"); }
   renderer.render(scene, camera);
 }
 </script>
