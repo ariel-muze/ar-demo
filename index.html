@@ -7,6 +7,7 @@
 <style>
   :root { --bg: #0d1412; --fg: #eaf3ee; --muted: #9db3a8; --green: #2bd96b; --panel: rgba(10, 18, 15, 0.72); color-scheme: dark; }
   html, body { height: 100%; margin: 0; }
+  [hidden] { display: none !important; }
   body { background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   #intro { min-height: 100%; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; gap: 18px;
            padding-block: 32px; padding-left: max(20px, env(safe-area-inset-left, 0px)); padding-right: max(20px, env(safe-area-inset-right, 0px)); max-width: 34rem; margin: 0 auto; }
@@ -40,18 +41,18 @@
 <div id="intro">
   <h1>A green cube on any flat surface</h1>
   <p>Point the phone at a flat surface (a table, the floor, a wall, a tilted board) and move it slowly from side to side, about 40&nbsp;cm away. The badge says <b>SEARCHING</b> while it gathers points on one surface.</p>
-  <p>When it has enough of the surface, the badge turns green, <b>LOCKED</b>, a yellow rectangle is drawn over the area it found, and an 8&nbsp;cm green cube sits flat on the surface at the rectangle's centre. Keep sweeping and the rectangle grows over more of the surface, with the cube following its centre. Both stay put while you walk around.</p>
-  <p>Tap <b>Find again</b> (or the screen) to throw the lock away and search where you are aiming. Plain or shiny wood is hard to see: turn on a light and lay a sheet of paper or a book on it.</p>
+  <p>When it has enough of the surface, the badge turns green, <b>LOCKED</b>, and the flat area it found is drawn as a blue patch with a yellow edge. Keep sweeping and the patch grows. The white ring marks its centre.</p>
+  <p>Tap <b>Place cube</b> (or the screen): an 8&nbsp;cm green cube is put flat on the surface at the ring, the patch disappears, and only the cube stays, fixed in place while you walk around. Tap <b>Find again</b> to start over. Plain or shiny wood is hard to see: turn on a light and lay a sheet of paper or a book on it.</p>
   <button id="go" disabled>Checking this phone…</button>
   <p id="why" hidden></p>
-  <p id="ver">version 4</p>
+  <p id="ver">version 5</p>
 </div>
 <div id="ov" hidden>
   <div id="status">Move the phone slowly over a flat surface</div>
   <div id="badge">SEARCHING</div>
   <div id="tip" hidden></div>
   <div id="stats"></div>
-  <div id="bar"><button id="again" class="main" type="button">Find again</button><button id="front" type="button" hidden>Put it in front of me</button><button id="stop" type="button">Exit</button></div>
+  <div id="bar"><button id="again" class="main" type="button">Find again</button><button id="placeBtn" class="main" type="button" hidden>Place cube</button><button id="front" type="button" hidden>Put it in front of me</button><button id="stop" type="button">Exit</button></div>
 </div>
 <script type="module">
 import * as THREE from "three";
@@ -107,25 +108,24 @@ const shadow = new THREE.Mesh(new THREE.CircleGeometry(CUBE_M * 0.85, 40).rotate
 shadow.position.y = 0.001; cube.add(shadow);
 cube.matrixAutoUpdate = false; cube.visible = false; scene.add(cube);
 
-// the locked surface: a rectangle over the area found, in the surface's own frame (y along its normal), with the
-// cube at its centre; both hang off one anchor
-const rectSheet = new THREE.Mesh(new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2),
-                                 new THREE.MeshBasicMaterial({ color: 0x3fb8ff, transparent: true, opacity: 0.18, depthWrite: false, side: THREE.DoubleSide }));
-rectSheet.position.y = 0.001;
-const rectLine = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(
-  [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]].map(([x, z]) => new THREE.Vector3(x, 0.002, z))),
-  new THREE.LineBasicMaterial({ color: 0xffd34d }));
-const rect = new THREE.Group(); rect.add(rectSheet, rectLine);
-const locked = new THREE.Group(); locked.add(rect);
+// the locked surface, in its own frame (y along its normal), hung off one anchor: the flat area found (the outline
+// of every hit on it), a ring at its centre where the cube will go, and the cube once it is placed
+const areaFill = new THREE.MeshBasicMaterial({ color: 0x3fb8ff, transparent: true, opacity: 0.3, depthWrite: false, side: THREE.DoubleSide });
+const areaEdge = new THREE.LineBasicMaterial({ color: 0xffd34d });
+const area = new THREE.Group();
+const target = new THREE.Mesh(new THREE.RingGeometry(0.03, 0.04, 32).rotateX(-Math.PI / 2),
+                              new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }));
+target.position.y = 0.003;
+const locked = new THREE.Group(); locked.add(area, target);
 locked.matrixAutoUpdate = false; locked.visible = false; scene.add(locked);
 cube.matrixAutoUpdate = true; scene.remove(cube); locked.add(cube);
-
-// for the simulated-session tests
-if (location.hash === "#debug") window.__ar = { locked, cube, rect };
 
 // the hits gathered while searching, shown as small dots so you can see the surface fill in
 const dotGeo = new THREE.SphereGeometry(0.004, 6, 4), dotMat = new THREE.MeshBasicMaterial({ color: 0x7fe0ff });
 const dots = new THREE.Group(); scene.add(dots);
+
+// for the simulated-session tests
+if (location.hash === "#debug") window.__ar = { locked, cube, area, target, scene, renderer, dots };
 
 // the planes ARCore reports, when Chrome shares them: their outlines, faint, any orientation
 const planeLines = new Map();
@@ -176,7 +176,7 @@ go.addEventListener("click", async () => {
   // planes first; feature points as well, which a plain table top gives sooner than a whole plane
   try { hitSource = await session.requestHitTestSource({ space: viewerSpace, entityTypes: ["plane", "point"] }); }
   catch (e) { hitSource = await session.requestHitTestSource({ space: viewerSpace }); }
-  session.addEventListener("select", () => reset());
+  session.addEventListener("select", () => (placed && grow && !cube.visible ? placeCube() : reset()));
   session.addEventListener("end", () => { location.reload(); });
   started = performance.now();
   renderer.setAnimationLoop(onFrame);
@@ -184,12 +184,14 @@ go.addEventListener("click", async () => {
 // a tap on a button is not a tap on the table
 $("bar").addEventListener("beforexrselect", (e) => e.preventDefault());
 $("again").addEventListener("click", (e) => { e.stopPropagation(); reset(); });
+$("placeBtn").addEventListener("click", (e) => { e.stopPropagation(); placeCube(); });
 $("front").addEventListener("click", (e) => { e.stopPropagation(); putInFront(); });
 $("stop").addEventListener("click", (e) => { e.stopPropagation(); session && session.end(); });
 
 function reset() {
   if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
   cand = null; grow = null; placed = false; locked.visible = false; cube.visible = false; lostFor = 0;
+  area.clear(); $("placeBtn").hidden = true; $("again").hidden = false;
   dots.clear(); started = performance.now(); $("front").hidden = true; tip("");
   badge("SEARCHING"); say("Move the phone slowly over a flat surface");
 }
@@ -284,15 +286,16 @@ function addDot(p) { const d = new THREE.Mesh(dotGeo, dotMat); d.position.copy(p
 // the surface is big enough: put the rectangle over it, the cube at its centre, and anchor both
 async function lock(frame, a, pts) {
   placed = true; dots.clear();
-  rect.position.set(0, 0, 0); rect.rotation.set(0, 0, 0); rect.scale.set(a.w, 1, a.h); rect.visible = true;
-  cube.visible = true; cube.position.set(0, 0, 0); cube.rotation.set(0, 0, 0);
+  cube.visible = false; cube.position.set(0, 0, 0); cube.rotation.set(0, 0, 0);
+  area.visible = true; target.visible = true; target.position.x = 0; target.position.z = 0;
   locked.matrix.copy(a.pose); locked.visible = true;
   // the points so far, in the locked surface's own 2-D coordinates, so later hits can keep growing the area
   const inv = a.pose.clone().invert();
   grow = { p2: pts.map((p) => { const q = p.clone().applyMatrix4(inv); return [q.x, q.z]; }), last: null, added: 0 };
+  drawArea();
   badge("LOCKED");
-  say("Locked: " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm. Walk around it");
-  $("front").hidden = true; tip("");
+  say("Flat area: " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm. Tap Place cube");
+  $("front").hidden = true; $("again").hidden = true; $("placeBtn").hidden = false; tip("");
   if (frame.createAnchor) {
     const pos = new THREE.Vector3(), q = new THREE.Quaternion(), sc = new THREE.Vector3();
     a.pose.decompose(pos, q, sc);
@@ -301,18 +304,58 @@ async function lock(frame, a, pts) {
   }
 }
 
-// after the lock, hits on the same surface keep growing the rectangle; the cube follows its centre
+// the convex outline of 2-D points (monotone chain)
+function hull(p2) {
+  const P = p2.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (P.length < 3) return P;
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], hi = [];
+  for (const p of P) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (const p of P.reverse()) { while (hi.length >= 2 && cross(hi[hi.length - 2], hi[hi.length - 1], p) <= 0) hi.pop(); hi.push(p); }
+  return lo.slice(0, -1).concat(hi.slice(0, -1));
+}
+
+// the flat area as the outline of its hits, less the outer few per cent; the ring goes to the centre of the
+// smallest rectangle around them
+function drawArea() {
+  const r = rectOf(grow.p2);
+  // keep the hits inside the trimmed rectangle, so a stray hit does not pull the outline out
+  const ca = r.ca, sa = r.sa, s0 = r.s, t0_ = r.t;
+  const kept = grow.p2.filter(([x, y]) => Math.abs(x * ca + y * sa - s0) <= r.w / 2 + 1e-6 && Math.abs(-x * sa + y * ca - t0_) <= r.h / 2 + 1e-6);
+  const H = hull(kept.length >= 3 ? kept : grow.p2);
+  area.clear();
+  if (H.length >= 3) {
+    const shape = new THREE.Shape(H.map(([x, y]) => new THREE.Vector2(x, y)));
+    const fill = new THREE.Mesh(new THREE.ShapeGeometry(shape).rotateX(Math.PI / 2), areaFill);
+    fill.position.y = 0.001;
+    const edge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(H.map(([x, y]) => new THREE.Vector3(x, 0.002, y))), areaEdge);
+    area.add(fill, edge);
+  }
+  target.position.set(r.cx, 0.003, r.cy);
+  grow.rect = r;
+  return r;
+}
+
+// after the lock, hits on the same surface keep growing the area until the cube is placed
 function growHit(p) {
+  if (cube.visible) return;
   const q = p.clone().applyMatrix4(locked.matrix.clone().invert());
   if (Math.abs(q.y) > PLANE_TOL_M) return;
   if (grow.last && Math.hypot(q.x - grow.last[0], q.z - grow.last[1]) < MIN_STEP_M) return;
   grow.last = [q.x, q.z]; grow.p2.push(grow.last);
   if (++grow.added % 5) return;
-  const r = rectOf(grow.p2), ang = -r.a * Math.PI / 180;
-  rect.position.set(r.cx, 0, r.cy); rect.rotation.y = ang; rect.scale.set(r.w, 1, r.h);
-  // small shifts are left alone so the cube does not creep
-  if (Math.hypot(r.cx - cube.position.x, r.cy - cube.position.z) > 0.02) { cube.position.set(r.cx, 0, r.cy); cube.rotation.y = ang; }
-  say("Locked: " + Math.round(r.w * 100) + " x " + Math.round(r.h * 100) + " cm. Sweep on to grow it, or walk around");
+  const r = drawArea();
+  say("Flat area: " + Math.round(r.w * 100) + " x " + Math.round(r.h * 100) + " cm. Sweep on to grow it, or tap Place cube");
+}
+
+// the trigger: the cube goes flat on the surface at the area's centre, and the area is hidden
+function placeCube() {
+  if (!grow) return;
+  const r = grow.rect || drawArea();
+  cube.position.set(r.cx, 0, r.cy); cube.rotation.y = -r.a * Math.PI / 180; cube.visible = true;
+  area.visible = false; target.visible = false;
+  $("placeBtn").hidden = true; $("again").hidden = false;
+  say("Cube placed. Walk around it");
 }
 
 // a plane ARCore itself reports under the hit, when Chrome shares planes: its outline is the area, if it is big
@@ -340,7 +383,7 @@ async function putInFront() {
   const p = new THREE.Vector3().setFromMatrixPosition(m4);
   const fwd = new THREE.Vector3(0, 0, -1).transformDirection(m4); fwd.y = 0; fwd.normalize();
   p.addScaledVector(fwd, 0.4); p.y -= 0.25;
-  locked.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); locked.visible = true; rect.visible = false; grow = null;
+  locked.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); locked.visible = true; area.visible = false; target.visible = false; grow = null;
   cube.visible = true; placed = true;
   if (frameRef && frameRef.createAnchor) {
     try {
@@ -348,7 +391,8 @@ async function putInFront() {
       anchor = await frameRef.createAnchor(new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace);
     } catch (e) { anchor = null; }
   }
-  $("front").hidden = true; tip("Not on a surface: this one floats in front of you. Tap Find again to search.");
+  $("front").hidden = true; $("placeBtn").hidden = true; $("again").hidden = false;
+  tip("Not on a surface: this one floats in front of you. Tap Find again to search.");
   badge("SEARCHING"); say("Cube in front of you");
 }
 
@@ -388,7 +432,7 @@ function onFrame(time, frame) {
     const p = tracked ? frame.getPose(anchor.anchorSpace, refSpace) : null;
     if (p) {
       locked.matrix.fromArray(p.transform.matrix);
-      if (lostFor > 15 && rect.visible) { badge("LOCKED"); say("Back on the surface"); }
+      if (lostFor > 15 && grow) { badge("LOCKED"); say("Back on the surface"); }
       lostFor = 0;
     }
     else if (++lostFor > 15) { badge("LOST"); say("Lost the surface. Hold still and aim back at it, or tap Find again"); }
