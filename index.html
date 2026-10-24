@@ -40,7 +40,7 @@
 <div id="intro">
   <h1>A green cube on any flat surface</h1>
   <p>Point the phone at a flat surface (a table, the floor, a wall, a tilted board) and move it slowly from side to side, about 40&nbsp;cm away. The badge says <b>SEARCHING</b> while it gathers points on one surface.</p>
-  <p>When it has enough of the surface, the badge turns green, <b>LOCKED</b>, a yellow rectangle is drawn over the area it found, and an 8&nbsp;cm green cube sits flat on the surface at the rectangle's centre. Both stay put while you walk around.</p>
+  <p>When it has enough of the surface, the badge turns green, <b>LOCKED</b>, a yellow rectangle is drawn over the area it found, and an 8&nbsp;cm green cube sits flat on the surface at the rectangle's centre. Keep sweeping and the rectangle grows over more of the surface, with the cube following its centre. Both stay put while you walk around.</p>
   <p>Tap <b>Find again</b> (or the screen) to throw the lock away and search where you are aiming. Plain or shiny wood is hard to see: turn on a light and lay a sheet of paper or a book on it.</p>
   <button id="go" disabled>Checking this phone…</button>
   <p id="why" hidden></p>
@@ -62,7 +62,7 @@ const CUBE_M = 0.08;            // edge, metres
 const LOCK_HITS = 25;           // hits on one surface before it counts as locked
 const LOCK_SPAN_M = 0.15;       // ... and they must cover at least this much of it in both directions
 const PLANE_TOL_M = 0.02;       // a hit this far off the surface belongs to another one
-const PLANE_TOL_DEG = 15;       // ... or one whose normal leans this much
+const PLANE_TOL_DEG = 25;       // ... or one whose normal leans this much (only until the points give their own)
 const MIN_STEP_M = 0.01;        // hits closer than this to the last kept one add nothing
 const HELP_AFTER_S = 10;        // no lock by then: show tips and offer to put the cube in front
 
@@ -120,6 +120,9 @@ const locked = new THREE.Group(); locked.add(rect);
 locked.matrixAutoUpdate = false; locked.visible = false; scene.add(locked);
 cube.matrixAutoUpdate = true; scene.remove(cube); locked.add(cube);
 
+// for the simulated-session tests
+if (location.hash === "#debug") window.__ar = { locked, cube, rect };
+
 // the hits gathered while searching, shown as small dots so you can see the surface fill in
 const dotGeo = new THREE.SphereGeometry(0.004, 6, 4), dotMat = new THREE.MeshBasicMaterial({ color: 0x7fe0ff });
 const dots = new THREE.Group(); scene.add(dots);
@@ -154,7 +157,7 @@ function drawPlanes(frame) {
 let session = null, hitSource = null, refSpace = null, viewerSpace = null, anchor = null, placed = false;
 let started = 0, frames = 0, t0 = 0, fps = 0, viewerPose = null, lostFor = 0;
 // the surface being gathered: a point on it, its normal, and the hits that agree with both
-let cand = null;
+let cand = null, grow = null;
 const say = (t) => { $("status").textContent = t; };
 const tip = (t) => { $("tip").textContent = t || ""; $("tip").hidden = !t; };
 const m4 = new THREE.Matrix4();
@@ -186,7 +189,7 @@ $("stop").addEventListener("click", (e) => { e.stopPropagation(); session && ses
 
 function reset() {
   if (anchor) { try { anchor.delete(); } catch (e) {} anchor = null; }
-  cand = null; placed = false; locked.visible = false; cube.visible = false; lostFor = 0;
+  cand = null; grow = null; placed = false; locked.visible = false; cube.visible = false; lostFor = 0;
   dots.clear(); started = performance.now(); $("front").hidden = true; tip("");
   badge("SEARCHING"); say("Move the phone slowly over a flat surface");
 }
@@ -235,15 +238,20 @@ function minRect(p2) {
 }
 
 // the area covered by points on a surface: the rectangle's centre, size, and a pose whose y axis is the normal
-function areaOf(pts, c, n) {
-  const [e1, e2] = axes(n);
-  const p2 = pts.map((p) => { const d = p.clone().sub(c); return [d.dot(e1), d.dot(e2)]; });
-  // drop the outer few per cent so one stray hit does not stretch the rectangle
+// the rectangle over 2-D points on a surface, after dropping the outer few per cent so one stray hit does not
+// stretch it
+function rectOf(p2) {
   const trim = (k) => { const v = p2.map((q) => q[k]).sort((a, b) => a - b);
     return [v[Math.floor(v.length * 0.03)], v[Math.ceil(v.length * 0.97) - 1]]; };
   const [x0, x1] = trim(0), [y0, y1] = trim(1);
   const kept = p2.filter(([x, y]) => x >= x0 && x <= x1 && y >= y0 && y <= y1);
-  const r = minRect(kept.length >= 4 ? kept : p2);
+  return minRect(kept.length >= 4 ? kept : p2);
+}
+
+function areaOf(pts, c, n) {
+  const [e1, e2] = axes(n);
+  const p2 = pts.map((p) => { const d = p.clone().sub(c); return [d.dot(e1), d.dot(e2)]; });
+  const r = rectOf(p2);
   const u = e1.clone().multiplyScalar(r.ca).addScaledVector(e2, r.sa);
   const z = new THREE.Vector3().crossVectors(u, n);
   const centre = c.clone().addScaledVector(e1, r.cx).addScaledVector(e2, r.cy);
@@ -252,13 +260,14 @@ function areaOf(pts, c, n) {
 
 // one more hit: it joins the surface being gathered, or starts a new one if it disagrees and that one is young
 function addHit(p, n) {
-  if (!cand || (cand.pts.length < 6 && (Math.abs(p.clone().sub(cand.c).dot(cand.n)) > PLANE_TOL_M || n.dot(cand.n) < Math.cos(PLANE_TOL_DEG * Math.PI / 180)))) {
-    cand = { c: p.clone(), n: n.clone(), pts: [p.clone()], misses: 0 }; dots.clear(); addDot(p); return;
-  }
+  if (!cand) { cand = { c: p.clone(), n: n.clone(), pts: [p.clone()], misses: 0, fitted: false }; dots.clear(); addDot(p); return; }
   const off = Math.abs(p.clone().sub(cand.c).dot(cand.n));
-  if (off > PLANE_TOL_M || n.dot(cand.n) < Math.cos(PLANE_TOL_DEG * Math.PI / 180)) {
-    // a mature surface survives stray hits, but many in a row mean the phone is now looking at another one
-    if (++cand.misses > 40) cand = null, dots.clear();
+  // a hit's own normal is noisy on point hits, so it only counts until the points span enough to fit one
+  const leans = !cand.fitted && n.dot(cand.n) < Math.cos(PLANE_TOL_DEG * Math.PI / 180);
+  if (off > PLANE_TOL_M || leans) {
+    // stray hits are ignored; a run of them means the phone is now looking at another surface. A young surface
+    // gives way after a few, a mature one after many
+    if (++cand.misses > (cand.pts.length < 8 ? 3 : 40)) { cand = null; dots.clear(); addHit(p, n); }
     return;
   }
   cand.misses = 0;
@@ -266,19 +275,21 @@ function addHit(p, n) {
   cand.pts.push(p.clone()); addDot(p);
   if (cand.pts.length >= 3 && cand.pts.length % 3 === 0) {
     const f = fitNormal(cand.pts, cand.n);
-    // the fit only takes over once the points spread in two directions; until then the hits' own normals lead
     const a = areaOf(cand.pts, f.c, f.n);
-    if (Math.min(a.w, a.h) > 0.06) { cand.c = f.c; cand.n = f.n; }
+    if (Math.min(a.w, a.h) > 0.06) { cand.c = f.c; cand.n = f.n; cand.fitted = true; }
   }
 }
 function addDot(p) { const d = new THREE.Mesh(dotGeo, dotMat); d.position.copy(p); dots.add(d); }
 
 // the surface is big enough: put the rectangle over it, the cube at its centre, and anchor both
-async function lock(frame, a) {
+async function lock(frame, a, pts) {
   placed = true; dots.clear();
-  rect.scale.set(a.w, 1, a.h); rect.visible = true;
-  cube.visible = true; cube.position.set(0, 0, 0);
+  rect.position.set(0, 0, 0); rect.rotation.set(0, 0, 0); rect.scale.set(a.w, 1, a.h); rect.visible = true;
+  cube.visible = true; cube.position.set(0, 0, 0); cube.rotation.set(0, 0, 0);
   locked.matrix.copy(a.pose); locked.visible = true;
+  // the points so far, in the locked surface's own 2-D coordinates, so later hits can keep growing the area
+  const inv = a.pose.clone().invert();
+  grow = { p2: pts.map((p) => { const q = p.clone().applyMatrix4(inv); return [q.x, q.z]; }), last: null, added: 0 };
   badge("LOCKED");
   say("Locked: " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm. Walk around it");
   $("front").hidden = true; tip("");
@@ -288,6 +299,20 @@ async function lock(frame, a) {
     try { anchor = await frame.createAnchor(new XRRigidTransform({ x: pos.x, y: pos.y, z: pos.z }, { x: q.x, y: q.y, z: q.z, w: q.w }), refSpace); }
     catch (e) { anchor = null; }
   }
+}
+
+// after the lock, hits on the same surface keep growing the rectangle; the cube follows its centre
+function growHit(p) {
+  const q = p.clone().applyMatrix4(locked.matrix.clone().invert());
+  if (Math.abs(q.y) > PLANE_TOL_M) return;
+  if (grow.last && Math.hypot(q.x - grow.last[0], q.z - grow.last[1]) < MIN_STEP_M) return;
+  grow.last = [q.x, q.z]; grow.p2.push(grow.last);
+  if (++grow.added % 5) return;
+  const r = rectOf(grow.p2), ang = -r.a * Math.PI / 180;
+  rect.position.set(r.cx, 0, r.cy); rect.rotation.y = ang; rect.scale.set(r.w, 1, r.h);
+  // small shifts are left alone so the cube does not creep
+  if (Math.hypot(r.cx - cube.position.x, r.cy - cube.position.z) > 0.02) { cube.position.set(r.cx, 0, r.cy); cube.rotation.y = ang; }
+  say("Locked: " + Math.round(r.w * 100) + " x " + Math.round(r.h * 100) + " cm. Sweep on to grow it, or walk around");
 }
 
 // a plane ARCore itself reports under the hit, when Chrome shares planes: its outline is the area, if it is big
@@ -302,7 +327,7 @@ function arcoreArea(frame, p) {
     if (Math.abs(p.clone().sub(o).dot(n)) > PLANE_TOL_M) continue;
     const pts = plane.polygon.map((q) => new THREE.Vector3(q.x, 0, q.z).applyMatrix4(m4));
     const a = areaOf(pts, o, n);
-    if (Math.min(a.w, a.h) >= LOCK_SPAN_M) return a;
+    if (Math.min(a.w, a.h) >= LOCK_SPAN_M) return { a, pts };
   }
   return null;
 }
@@ -315,7 +340,7 @@ async function putInFront() {
   const p = new THREE.Vector3().setFromMatrixPosition(m4);
   const fwd = new THREE.Vector3(0, 0, -1).transformDirection(m4); fwd.y = 0; fwd.normalize();
   p.addScaledVector(fwd, 0.4); p.y -= 0.25;
-  locked.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); locked.visible = true; rect.visible = false;
+  locked.matrix.makeRotationY(Math.atan2(-fwd.x, -fwd.z)).setPosition(p); locked.visible = true; rect.visible = false; grow = null;
   cube.visible = true; placed = true;
   if (frameRef && frameRef.createAnchor) {
     try {
@@ -342,11 +367,11 @@ function onFrame(time, frame) {
     if (hp) {
       const p = new THREE.Vector3().setFromMatrixPosition(m4), n = new THREE.Vector3().setFromMatrixColumn(m4, 1).normalize();
       const big = arcoreArea(frame, p);
-      if (big) lock(frame, big);
+      if (big) lock(frame, big.a, big.pts);
       else {
         addHit(p, n);
         const a = cand && cand.pts.length >= 4 ? areaOf(cand.pts, cand.c, cand.n) : null;
-        if (a && cand.pts.length >= LOCK_HITS && Math.min(a.w, a.h) >= LOCK_SPAN_M) lock(frame, a);
+        if (a && cand.pts.length >= LOCK_HITS && Math.min(a.w, a.h) >= LOCK_SPAN_M) lock(frame, a, cand.pts);
         else say("Found a surface: " + (cand ? cand.pts.length : 0) + "/" + LOCK_HITS + " points" +
                  (a ? ", " + Math.round(a.w * 100) + " x " + Math.round(a.h * 100) + " cm (need " + LOCK_SPAN_M * 100 + ")" : "") + ". Keep sweeping");
       }
@@ -357,6 +382,7 @@ function onFrame(time, frame) {
       $("front").hidden = false;
     }
   }
+  if (placed && grow && hp && lostFor === 0) growHit(new THREE.Vector3().fromArray(hp.transform.matrix, 12));
   if (anchor) {
     const tracked = !frame.trackedAnchors || frame.trackedAnchors.has(anchor);
     const p = tracked ? frame.getPose(anchor.anchorSpace, refSpace) : null;
